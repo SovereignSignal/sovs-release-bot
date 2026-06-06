@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenClaw Release Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=releasebot
+WorkingDirectory=/opt/sovs-release-bot
+EnvironmentFile=/opt/sovs-release-bot/.env
+ExecStart=/usr/bin/python3 /opt/sovs-release-bot/bot.py --daemon
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
