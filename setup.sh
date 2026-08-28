@@ -29,7 +29,7 @@ TELEGRAM_CHAT_ID=your-chat-id-here
 CHECK_INTERVAL=30
 STATE_FILE=/opt/sovs-release-bot/data/last-version.txt
 STATE_DIR=/opt/sovs-release-bot/data
-WATCH_PACKAGES=openclaw,hermes-agent
+WATCH_PACKAGES=openclaw,hermes-agent,codex,claude-code
 ENVEOF
     sudo chmod 600 "$BOT_DIR/.env"
     sudo chown releasebot:releasebot "$BOT_DIR/.env"
