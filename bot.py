@@ -8,6 +8,7 @@ with a summary of changes when a new version is published.
 Usage:
     python3 bot.py              # Check once and exit
     python3 bot.py --daemon     # Run continuously (check every 30 min)
+    python3 bot.py --status     # Print npm + GitHub vs stored baselines (no Telegram)
     python3 bot.py --test       # Send a test message with current version info
 """
 
@@ -20,8 +21,8 @@ import sys
 import time
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 SUMMARY_TIMEOUT = _int_env("SUMMARY_TIMEOUT", 30)
+GH_RELEASE_PAGE_SIZE = _int_env("GH_RELEASE_PAGE_SIZE", 15)
 
 PACKAGE_CONFIG = {
     "openclaw": {
@@ -52,30 +54,39 @@ PACKAGE_CONFIG = {
         "npm": "openclaw",
         "github": "openclaw/openclaw",
         "docker": "ghcr.io/openclaw/openclaw:{version}",
+        "github_tag_prefixes": ["v"],
+        # npm `latest` has been frozen on 2026.7.x while new work ships as betas.
+        "include_prereleases": True,
     },
     "hermes-agent": {
         "label": "Hermes Agent",
         "emoji": "🪽",
         "npm": "hermes-agent",
-        "github": "wyrtensi/hermes-agent-npm",
+        "github": "NousResearch/hermes-agent",
+        "github_tag_prefixes": ["v"],
+        "include_prereleases": False,
     },
     "codex": {
         "label": "Codex",
         "emoji": "⌨️",
         "npm": "@openai/codex",
         "github": "openai/codex",
+        "github_tag_prefixes": ["rust-v", "v"],
+        "include_prereleases": False,
     },
     "claude-code": {
         "label": "Claude Code",
         "emoji": "✳️",
         "npm": "@anthropic-ai/claude-code",
         "github": "anthropics/claude-code",
+        "github_tag_prefixes": ["v"],
+        "include_prereleases": False,
     },
 }
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
-def fetch_json(url: str, timeout: int = 15, warn: bool = True) -> dict | None:
+def fetch_json(url: str, timeout: int = 15, warn: bool = True) -> Any:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "sovs-release-bot/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -111,14 +122,88 @@ def package_config(package_key: str) -> dict:
     config.setdefault("npm", package_key)
     config.setdefault("label", config["npm"])
     config.setdefault("emoji", "📦")
+    config.setdefault("github_tag_prefixes", ["v"])
+    config.setdefault("include_prereleases", False)
     return config
+
+
+def watches_prereleases(package_key: str) -> bool:
+    """WATCH_PRERELEASES overrides package defaults when set.
+
+    unset  → use PACKAGE_CONFIG.include_prereleases
+    all    → every watched package
+    none   → no prereleases
+    csv    → only those keys
+    """
+    raw = os.environ.get("WATCH_PRERELEASES")
+    if raw is None:
+        return bool(package_config(package_key).get("include_prereleases"))
+    lowered = raw.strip().lower()
+    if lowered in ("", "none", "false", "0"):
+        return False
+    if lowered == "all":
+        return True
+    return package_key in {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def normalize_version(value: str) -> str:
+    if not value:
+        return ""
+    v = value.strip()
+    lower = v.lower()
+    for prefix in ("rust-v", "rust-", "v"):
+        if lower.startswith(prefix):
+            v = v[len(prefix):]
+            break
+    return v.strip()
+
+
+def version_in_text(version: str, text: str) -> bool:
+    """True if `version` appears in `text` as a full version token (not a prefix).
+
+    Accepts an optional `v` / `rust-v` prefix so `0.20.6` matches
+    `Hermes Agent v0.20.6 (v2026.8.27)` and `0.150.1` matches `rust-v0.150.1`,
+    without treating `0.150.1` as a hit inside `rust-v0.150.10`.
+    """
+    nv = normalize_version(version)
+    if not nv or not text:
+        return False
+    if normalize_version(text.strip()) == nv:
+        return True
+    return re.search(
+        rf"(?<![\w.])(?:rust-v|v)?{re.escape(nv)}(?![\w.])",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
+def release_matches_version(release: dict | None, version: str) -> bool:
+    if not release or not version:
+        return False
+    blob = " ".join(filter(None, [release.get("tag_name") or "", release.get("name") or ""]))
+    return version_in_text(version, blob)
+
+
+def github_tag_candidates(package_key: str, version: str) -> list[str]:
+    prefixes = package_config(package_key).get("github_tag_prefixes") or ["v"]
+    tags: list[str] = []
+    for prefix in prefixes:
+        tags.append(f"{prefix}{version}")
+    tags.append(version)
+    seen: set[str] = set()
+    out: list[str] = []
+    for tag in tags:
+        if tag and tag not in seen:
+            seen.add(tag)
+            out.append(tag)
+    return out
 
 
 def get_npm_latest(package_key: str) -> dict | None:
     config = package_config(package_key)
     package_name = config["npm"]
     data = fetch_json(f"https://registry.npmjs.org/{urllib.parse.quote(package_name, safe='@/')}")
-    if not data:
+    if not data or not isinstance(data, dict):
         return None
     version = data.get("dist-tags", {}).get("latest")
     if not version:
@@ -136,22 +221,71 @@ def get_npm_latest(package_key: str) -> dict | None:
     }
 
 
-def get_gh_release(package_key: str, version: str) -> dict | None:
-    """Get GitHub release for a version. Tries exact tag, then with -N suffix."""
+def list_gh_releases(package_key: str, include_prereleases: bool, per_page: int | None = None) -> list[dict]:
     repo = package_config(package_key).get("github")
     if not repo:
+        return []
+    page_size = per_page or GH_RELEASE_PAGE_SIZE
+    data = fetch_json(
+        f"https://api.github.com/repos/{repo}/releases?per_page={page_size}",
+        warn=False,
+    )
+    if not isinstance(data, list):
+        return []
+    out = []
+    for rel in data:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        if rel.get("prerelease") and not include_prereleases:
+            continue
+        out.append(rel)
+    return out
+
+
+def newest_gh_release(package_key: str) -> dict | None:
+    releases = list_gh_releases(package_key, include_prereleases=watches_prereleases(package_key))
+    return releases[0] if releases else None
+
+
+def get_gh_release(package_key: str, version: str) -> dict | None:
+    """Get GitHub release for a version. Tries configured tag prefixes, then recent releases."""
+    repo = package_config(package_key).get("github")
+    if not repo or not version:
         return None
-    # Try exact tag first
-    data = fetch_json(f"https://api.github.com/repos/{repo}/releases/tags/v{version}", warn=False)
-    if data and data.get("body"):
-        return data
 
-    # Try latest release (might have -1 suffix like v2026.3.13-1)
-    data = fetch_json(f"https://api.github.com/repos/{repo}/releases/latest", warn=False)
-    if data and version in data.get("tag_name", ""):
-        return data
+    for tag in github_tag_candidates(package_key, version):
+        data = fetch_json(
+            f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}",
+            warn=False,
+        )
+        if isinstance(data, dict) and data.get("tag_name"):
+            return data
 
-    return data
+    # Official Hermes tags are date-based (v2026.8.27) while npm is semver (0.20.6).
+    for rel in list_gh_releases(package_key, include_prereleases=True):
+        if release_matches_version(rel, version):
+            return rel
+
+    return None
+
+
+def npm_info_from_github(package_key: str, gh_release: dict, npm_info: dict | None) -> dict:
+    """Build the npm_info-shaped dict used by format_release_message for a GitHub-only alert."""
+    config = package_config(package_key)
+    tag = gh_release.get("tag_name") or ""
+    version = normalize_version(tag) or tag
+    name = gh_release.get("name") or ""
+    # Prefer a semver in the title when the tag is a calendar version (Hermes).
+    semver = re.search(r"\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\b", name)
+    if semver and not re.match(r"^\d{4}\.\d{1,2}\.\d", semver.group(1)):
+        version = semver.group(1)
+    return {
+        "version": version,
+        "published": gh_release.get("published_at") or (npm_info or {}).get("published") or "unknown",
+        "description": (npm_info or {}).get("description") or "",
+        "repository": f"https://github.com/{config['github']}" if config.get("github") else "",
+        "package": (npm_info or {}).get("package") or config["npm"],
+    }
 
 
 def parse_changelog(body: str) -> dict:
@@ -167,20 +301,20 @@ def parse_changelog(body: str) -> dict:
         "other": [],
         "contributors": [],
         "pr_count": 0,
+        "excerpt": [],
     }
 
     if not body:
         return result
 
-    # Extract "What's Changed" section
-    changes_match = re.search(r"## What's Changed\s*\n(.*?)(?=\n## |\n\*\*Full Changelog|$)", body, re.DOTALL)
-    if not changes_match:
-        # Try without header
-        changes_match = re.search(r"\* .+?(?:by @|$)", body, re.DOTALL)
-
+    # Extract "What's Changed" section (Claude Code uses lowercase "changed")
+    changes_match = re.search(
+        r"## What's Changed\s*\n(.*?)(?=\n## |\n\*\*Full Changelog|$)",
+        body,
+        re.DOTALL | re.IGNORECASE,
+    )
     changes_text = changes_match.group(1) if changes_match else body
 
-    # Parse individual PR lines: "* fix(thing): description by @user in https://..."
     pr_pattern = re.compile(
         r"\*\s*(.+?)\s+by\s+@(\S+)\s+in\s+https://github\.com/\S+/pull/(\d+)",
         re.MULTILINE,
@@ -194,7 +328,6 @@ def parse_changelog(body: str) -> dict:
         contributors.add(author)
         result["pr_count"] += 1
 
-        # Classify by conventional commit prefix
         title_lower = title.lower()
         clean_title = re.sub(r"^(feat|fix|chore|docs|refactor|perf|test|ci|build|style)\([^)]*\):\s*", "", title, flags=re.IGNORECASE)
         clean_title = re.sub(r"^(feat|fix|chore|docs|refactor|perf|test|ci|build|style):\s*", "", clean_title, flags=re.IGNORECASE)
@@ -214,12 +347,36 @@ def parse_changelog(body: str) -> dict:
 
     result["contributors"] = sorted(contributors)
 
-    # Extract any important note at the top (before What's Changed)
     important = re.search(r"^(Important:.*?)(?=\n##|\n\*\s)", body, re.DOTALL)
     if important:
         result["summary"] = important.group(1).strip()[:200]
 
+    if not result["features"] and not result["fixes"] and not result["other"] and not result["breaking"]:
+        result["excerpt"] = extract_plain_excerpt(body)
+
     return result
+
+
+def extract_plain_excerpt(body: str, limit: int = 4) -> list[str]:
+    """Pull a few useful lines from free-form release notes (Hermes, Codex, OpenClaw)."""
+    lines: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") or set(line) <= {"-", "=", "*"}:
+            continue
+        if line.lower().startswith("full changelog"):
+            continue
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^>\s+", "", line)
+        line = line.replace("**", "")
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line[:220])
+        if len(lines) >= limit:
+            break
+    return lines
 
 
 def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
@@ -264,7 +421,6 @@ def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None)
     if not summary:
         return ""
 
-    # Keep Telegram alerts compact even if the model ignores the prompt.
     lines = [line.rstrip() for line in summary.splitlines() if line.strip()]
     return "\n".join(lines[:6])[:1200]
 
@@ -279,35 +435,31 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
     gh_url = gh_release.get("html_url") if gh_release else ""
     repo_url = f"https://github.com/{repo}" if repo else ""
     docker_tag = config.get("docker", "").format(version=version) if config.get("docker") else ""
+    prerelease = bool(gh_release and gh_release.get("prerelease"))
 
-    # Header
-    msg = f"{config['emoji']} <b>{_esc(config['label'])} {version}</b>\n\n"
+    msg = f"{config['emoji']} <b>{_esc(config['label'])} {version}</b>"
+    if prerelease:
+        msg += " <i>(pre-release)</i>"
+    msg += "\n\n"
     if npm_info.get("description"):
         msg += f"{_esc(npm_info['description'])}\n\n"
 
     llm_summary = summarize_release(package_key, npm_info, gh_release)
     if llm_summary:
-        # The summary is Markdown from the LLM; render it as Telegram HTML so
-        # markers don't show up literally. (Do NOT _esc() here — the converter
-        # escapes internally and emits its own tags.)
         msg += f"{md_to_telegram_html(llm_summary)}\n\n"
 
-    # Parse changelog
     body = gh_release.get("body", "") if gh_release else ""
     changelog = parse_changelog(body)
 
-    # Summary line
     if changelog["summary"]:
         msg += f"ℹ️ {_esc(changelog['summary'])}\n\n"
 
-    # Breaking changes (always show)
     if changelog["breaking"]:
         msg += "🚨 <b>Breaking:</b>\n"
         for item in changelog["breaking"][:5]:
             msg += f"  • {_esc(item)}\n"
         msg += "\n"
 
-    # Features (top 5)
     if changelog["features"]:
         msg += "✨ <b>Features:</b>\n"
         for item in changelog["features"][:5]:
@@ -316,7 +468,6 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
             msg += f"  <i>...and {len(changelog['features']) - 5} more</i>\n"
         msg += "\n"
 
-    # Fixes (top 5)
     if changelog["fixes"]:
         msg += "🔧 <b>Fixes:</b>\n"
         for item in changelog["fixes"][:5]:
@@ -325,7 +476,6 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
             msg += f"  <i>...and {len(changelog['fixes']) - 5} more</i>\n"
         msg += "\n"
 
-    # Other changes (summarized count only if many)
     if changelog["other"]:
         if len(changelog["other"]) <= 3:
             msg += "📦 <b>Other:</b>\n"
@@ -334,8 +484,12 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
             msg += "\n"
         else:
             msg += f"📦 +{len(changelog['other'])} other changes\n\n"
+    elif changelog.get("excerpt") and not llm_summary:
+        msg += "📝 <b>Notes:</b>\n"
+        for item in changelog["excerpt"][:4]:
+            msg += f"  • {_esc(item)}\n"
+        msg += "\n"
 
-    # Stats line
     stats = []
     if changelog["pr_count"]:
         stats.append(f"{changelog['pr_count']} PRs")
@@ -344,14 +498,11 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
     if stats:
         msg += f"📊 {' · '.join(stats)}\n"
 
-    # Links
     links = [f"<a href=\"https://www.npmjs.com/package/{_url_package(package_name)}/v/{version}\">npm</a>"]
     if gh_url:
         links.insert(0, f"<a href=\"{gh_url}\">Release Notes</a>")
     elif repo_url:
         links.append(f"<a href=\"{repo_url}\">GitHub</a>")
-    # Normalize spacing: exactly one blank line between the body and the footer,
-    # no matter which sections (summary, breaking, features, ...) were present.
     msg = msg.rstrip() + "\n\n"
     msg += f"📦 Published: {published}\n"
     if docker_tag:
@@ -386,25 +537,19 @@ def md_to_telegram_html(text: str) -> str:
     for raw in text.splitlines():
         line = raw.rstrip()
 
-        # Heading "# ..." → bold line (drop the marker)
         heading = re.match(r"\s*#{1,6}\s+(.*)", line)
         if heading:
             line = heading.group(1)
 
-        # Bullet "- " / "* " / "+ " → "• " (preserve as list marker)
         bullet = re.match(r"\s*[-*+]\s+(.*)", line)
         if bullet:
             line = bullet.group(1)
 
-        # Escape HTML BEFORE inserting our own tags
         line = _esc(line)
 
-        # Inline code first, so * inside code isn't treated as bold
         line = re.sub(r"`([^`]+)`", r"<code>\1</code>", line)
-        # Bold: **x** or __x__
         line = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", line)
         line = re.sub(r"__([^_]+)__", r"<b>\1</b>", line)
-        # Links: [text](http...)
         line = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', line)
 
         if heading:
@@ -415,7 +560,7 @@ def md_to_telegram_html(text: str) -> str:
         lines.append(line)
 
     html = "\n".join(lines)
-    html = re.sub(r"\n{3,}", "\n\n", html)  # collapse runs of blank lines
+    html = re.sub(r"\n{3,}", "\n\n", html)
     return html.strip()
 
 
@@ -427,68 +572,177 @@ def state_file_for(package_key: str) -> Path:
     return STATE_DIR / f"last-version-{safe}.txt"
 
 
-def get_stored_version(package_key: str = "openclaw") -> str:
+def empty_state() -> dict:
+    return {"npm": "", "github_tag": ""}
+
+
+def load_state(package_key: str) -> dict:
+    """Read stored baselines. Old plaintext files are treated as npm-only state."""
     try:
-        return state_file_for(package_key).read_text().strip()
+        text = state_file_for(package_key).read_text().strip()
     except FileNotFoundError:
-        return ""
+        return empty_state()
+    if not text:
+        return empty_state()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return {
+                    "npm": str(data.get("npm") or "").strip(),
+                    "github_tag": str(data.get("github_tag") or "").strip(),
+                }
+        except json.JSONDecodeError:
+            pass
+    return {"npm": text, "github_tag": ""}
 
 
-def store_version(package_key: str, version: str):
+def save_state(package_key: str, state: dict):
     path = state_file_for(package_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(version + "\n")
+    payload = {
+        "npm": (state.get("npm") or "").strip(),
+        "github_tag": (state.get("github_tag") or "").strip(),
+    }
+    path.write_text(json.dumps(payload) + "\n")
+
+
+def get_stored_version(package_key: str = "openclaw") -> str:
+    state = load_state(package_key)
+    return state["npm"] or state["github_tag"]
 
 
 # ── Telegram ────────────────────────────────────────────────────────
 
-def send_telegram(text: str, parse_mode: str = "HTML"):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": "true",
-    }).encode()
+def send_telegram(text: str, parse_mode: str | None = "HTML") -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[ERROR] Telegram credentials missing; message not sent")
+        return False
 
-    try:
-        req = urllib.request.Request(url, data=payload, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            if result.get("ok"):
-                print(f"[OK] Telegram message sent")
-            else:
-                print(f"[ERROR] Telegram API: {result}")
-    except Exception as e:
-        print(f"[ERROR] Failed to send Telegram message: {e}")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    def _post(payload_text: str, mode: str | None) -> dict | None:
+        fields = {
+            "chat_id": CHAT_ID,
+            "text": payload_text,
+            "disable_web_page_preview": "true",
+        }
+        if mode:
+            fields["parse_mode"] = mode
+        payload = urllib.parse.urlencode(fields).encode()
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            print(f"[ERROR] Failed to send Telegram message: {e}")
+            return None
+
+    result = _post(text, parse_mode)
+    if result and result.get("ok"):
+        print("[OK] Telegram message sent")
+        return True
+
+    if parse_mode:
+        print("[WARN] Telegram HTML send failed, retrying as plain text")
+        plain = re.sub(r"<[^>]+>", "", text)
+        plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return send_telegram(plain, parse_mode=None)
+
+    print(f"[ERROR] Telegram API: {result}")
+    return False
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
+def _sync_matching_channel(state: dict, npm_version: str, gh_release: dict | None) -> dict | None:
+    """If a newly seen GitHub tag is the same release we already announced via npm, just record it."""
+    if not gh_release:
+        return None
+    gh_tag = gh_release.get("tag_name") or ""
+    if not gh_tag or gh_tag == state.get("github_tag"):
+        return None
+    known = state.get("npm") or npm_version
+    if known and release_matches_version(gh_release, known):
+        return {"npm": state.get("npm") or npm_version, "github_tag": gh_tag}
+    if npm_version and release_matches_version(gh_release, npm_version) and npm_version == state.get("npm"):
+        return {"npm": npm_version, "github_tag": gh_tag}
+    return None
+
+
 def check_package(package_key: str) -> bool:
     npm_info = get_npm_latest(package_key)
-    if not npm_info:
-        print(f"[WARN] Could not fetch npm registry for {package_key}")
+    gh_newest = newest_gh_release(package_key)
+    state = load_state(package_key)
+
+    npm_version = (npm_info or {}).get("version") or ""
+    gh_tag = (gh_newest or {}).get("tag_name") or ""
+
+    print(
+        f"[CHECK] {package_key}: npm={npm_version or '-'} gh={gh_tag or '-'} "
+        f"stored_npm={state['npm'] or '-'} stored_gh={state['github_tag'] or '-'} "
+        f"prereleases={'on' if watches_prereleases(package_key) else 'off'}"
+    )
+
+    if not npm_info and not gh_newest:
+        print(f"[WARN] Could not fetch npm registry or GitHub releases for {package_key}")
         return False
 
-    latest = npm_info["version"]
-    stored = get_stored_version(package_key)
-
-    if latest == stored:
+    if not state["npm"] and not state["github_tag"]:
+        print(f"[INIT] First run for {package_key}, storing npm={npm_version or '-'} gh={gh_tag or '-'}")
+        save_state(package_key, {"npm": npm_version, "github_tag": gh_tag})
         return False
 
-    if not stored:
-        print(f"[INIT] First run for {package_key}, storing current version: {latest}")
-        store_version(package_key, latest)
+    npm_new = bool(npm_version and npm_version != state["npm"])
+    gh_new = bool(gh_tag and gh_tag != state["github_tag"])
+
+    if gh_new and not npm_new:
+        synced = _sync_matching_channel(state, npm_version, gh_newest)
+        if synced:
+            print(f"[SYNC] {package_key}: recorded GitHub tag {synced['github_tag']} (same release as npm {synced['npm']})")
+            save_state(package_key, synced)
+            return False
+
+    if not npm_new and not gh_new:
         return False
 
-    print(f"[NEW] {package_key}: {stored} → {latest}")
+    sent_any = False
+    new_state = dict(state)
 
-    gh_release = get_gh_release(package_key, latest)
-    msg = format_release_message(package_key, npm_info, gh_release)
-    send_telegram(msg)
-    store_version(package_key, latest)
-    return True
+    if npm_new and npm_info:
+        print(f"[NEW] {package_key} npm: {state['npm'] or '-'} → {npm_version}")
+        gh_for_msg = get_gh_release(package_key, npm_version)
+        if not gh_for_msg and gh_newest and release_matches_version(gh_newest, npm_version):
+            gh_for_msg = gh_newest
+        if send_telegram(format_release_message(package_key, npm_info, gh_for_msg)):
+            new_state["npm"] = npm_version
+            if gh_for_msg and gh_for_msg.get("tag_name"):
+                new_state["github_tag"] = gh_for_msg["tag_name"]
+            sent_any = True
+        else:
+            print(f"[WARN] {package_key}: Telegram send failed for npm {npm_version}; will retry next cycle")
+            return sent_any
+
+    # If npm and GitHub moved together to the same release, the npm send already covered it.
+    if gh_new and gh_newest:
+        already_announced = release_matches_version(gh_newest, new_state.get("npm") or "")
+        if already_announced:
+            new_state["github_tag"] = gh_tag
+        elif not npm_new or not release_matches_version(gh_newest, npm_version):
+            print(f"[NEW] {package_key} github: {state['github_tag'] or '-'} → {gh_tag}")
+            info = npm_info_from_github(package_key, gh_newest, npm_info)
+            if send_telegram(format_release_message(package_key, info, gh_newest)):
+                new_state["github_tag"] = gh_tag
+                sent_any = True
+            else:
+                print(f"[WARN] {package_key}: Telegram send failed for {gh_tag}; will retry next cycle")
+                save_state(package_key, new_state)
+                return sent_any
+        else:
+            new_state["github_tag"] = gh_tag
+
+    save_state(package_key, new_state)
+    return sent_any
 
 
 def check_once() -> bool:
@@ -498,33 +752,53 @@ def check_once() -> bool:
     return found
 
 
+def print_status():
+    print(f"Watching: {', '.join(WATCH_PACKAGES)}")
+    print(f"{'package':<14} {'npm latest':<22} {'github':<28} {'stored npm':<22} {'stored gh':<28} alert?")
+    print("-" * 130)
+    for package_key in WATCH_PACKAGES:
+        npm_info = get_npm_latest(package_key)
+        gh = newest_gh_release(package_key)
+        state = load_state(package_key)
+        npm_version = (npm_info or {}).get("version") or "-"
+        gh_tag = (gh or {}).get("tag_name") or "-"
+        npm_new = bool(npm_info and npm_info["version"] != state["npm"] and state["npm"])
+        gh_new = bool(gh and gh.get("tag_name") != state["github_tag"] and (state["npm"] or state["github_tag"]))
+        if gh_new and gh and release_matches_version(gh, state["npm"] or ""):
+            gh_new = False
+        alert = "yes" if (npm_new or gh_new) else ("init" if not state["npm"] and not state["github_tag"] else "no")
+        pre = " (pre)" if watches_prereleases(package_key) else ""
+        print(
+            f"{package_key:<14} {npm_version:<22} {(gh_tag + pre):<28} "
+            f"{(state['npm'] or '-'):<22} {(state['github_tag'] or '-'):<28} {alert}"
+        )
+
+
 def test_message(package_key: str = "openclaw"):
     npm_info = get_npm_latest(package_key)
-    if not npm_info:
-        print(f"ERROR: Could not fetch npm registry for {package_key}")
+    gh_release = newest_gh_release(package_key)
+    if npm_info:
+        matched = get_gh_release(package_key, npm_info["version"]) or (
+            gh_release if gh_release and release_matches_version(gh_release, npm_info["version"]) else None
+        )
+        msg = format_release_message(package_key, npm_info, matched or gh_release)
+    elif gh_release:
+        msg = format_release_message(package_key, npm_info_from_github(package_key, gh_release, None), gh_release)
+    else:
+        print(f"ERROR: Could not fetch npm registry or GitHub for {package_key}")
         sys.exit(1)
 
-    gh_release = get_gh_release(package_key, npm_info["version"])
-    msg = format_release_message(package_key, npm_info, gh_release)
-
-    # Prepend test banner
     msg = "🧪 <b>TEST — Release Bot Preview</b>\n\n" + msg
-    send_telegram(msg)
-    print(f"Test message sent for {package_key} {npm_info['version']}")
+    if not send_telegram(msg):
+        print(f"ERROR: Test message failed for {package_key}")
+        sys.exit(1)
+    version = npm_info["version"] if npm_info else (gh_release or {}).get("tag_name", "?")
+    print(f"Test message sent for {package_key} {version}")
 
 
 def daemon():
     print(f"[START] Sovs Release Bot — checking {', '.join(WATCH_PACKAGES)} every {CHECK_INTERVAL}min")
-
-    for package_key in WATCH_PACKAGES:
-        npm_info = get_npm_latest(package_key)
-        if npm_info:
-            stored = get_stored_version(package_key)
-            if not stored:
-                store_version(package_key, npm_info["version"])
-                print(f"[INIT] {package_key}: stored initial version {npm_info['version']}")
-            else:
-                print(f"[INIT] {package_key}: stored {stored}, latest {npm_info['version']}")
+    print_status()
 
     while True:
         try:
@@ -534,7 +808,24 @@ def daemon():
         time.sleep(CHECK_INTERVAL * 60)
 
 
+def _cli_packages() -> list[str]:
+    if "--package" not in sys.argv:
+        return ["openclaw"]
+    try:
+        value = sys.argv[sys.argv.index("--package") + 1]
+    except IndexError:
+        print("ERROR: --package requires a package key or 'all'")
+        sys.exit(1)
+    if value == "all":
+        return list(WATCH_PACKAGES)
+    return [value]
+
+
 def main():
+    if "--status" in sys.argv:
+        print_status()
+        return
+
     if not BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set")
         sys.exit(1)
@@ -545,14 +836,8 @@ def main():
     if "--daemon" in sys.argv:
         daemon()
     elif "--test" in sys.argv:
-        package_key = "openclaw"
-        if "--package" in sys.argv:
-            try:
-                package_key = sys.argv[sys.argv.index("--package") + 1]
-            except IndexError:
-                print("ERROR: --package requires a package key")
-                sys.exit(1)
-        test_message(package_key)
+        for package_key in _cli_packages():
+            test_message(package_key)
     else:
         found = check_once()
         if not found:

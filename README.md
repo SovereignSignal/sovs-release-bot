@@ -1,10 +1,11 @@
 # Sovs Release Bot
 
-Telegram bot that alerts when new **OpenClaw**, **Hermes Agent**, **Codex**, and **Claude Code** versions are published (watches the npm registry plus GitHub release notes).
+Telegram bot that alerts when new **OpenClaw**, **Hermes Agent**, **Codex**, and **Claude Code** versions are published. It watches both the npm `latest` tag **and** GitHub releases, because those channels often diverge (OpenClaw betas, Hermes date tags, Codex `rust-v*` tags).
 
 ## What it does
 
-- Monitors configured npm packages every 30 minutes (configurable)
+- Monitors configured npm `latest` tags **and** GitHub releases every 30 minutes (configurable)
+- OpenClaw prereleases are on by default (their `latest` npm tag has been stale while betas ship); Codex/Hermes/Claude Code alert on stables unless you set `WATCH_PRERELEASES`
 - When a new version is detected → sends a Telegram alert with:
   - Package name
   - Version number
@@ -52,6 +53,7 @@ sudo systemctl start sovs-release-bot
 # Test
 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy python3 bot.py --test
 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy python3 bot.py --test --package hermes-agent
+python3 bot.py --status
 ```
 
 ## Environment variables
@@ -64,6 +66,7 @@ TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy python3 bot.py --test --package herm
 | `STATE_FILE` | No | `/opt/sovs-release-bot/data/last-version.txt` | Backward-compatible OpenClaw version state file |
 | `STATE_DIR` | No | `/opt/sovs-release-bot/data` | State directory for non-OpenClaw packages |
 | `WATCH_PACKAGES` | No | `openclaw,hermes-agent,codex,claude-code` | Comma-separated package keys or npm package names |
+| `WATCH_PRERELEASES` | No | package defaults (OpenClaw on) | `all`, `none`, or CSV of package keys. Overrides which GitHub prereleases are treated as new versions. |
 | `OLLAMA_API_KEY` | No | — | Enables optional release summaries through the Ollama generate API. Leave unset to use normal changelog formatting only. |
 | `OLLAMA_BASE_URL` | No | `https://ollama.com/api` | Ollama API base URL. |
 | `OLLAMA_MODEL` | No | `gpt-oss:20b` | Model name sent to Ollama. |
@@ -91,20 +94,22 @@ self-hosting on your own server.
 ```bash
 python3 bot.py              # Check once, exit
 python3 bot.py --daemon     # Run continuously
+python3 bot.py --status     # Print npm + GitHub vs stored baselines (no Telegram)
 python3 bot.py --test       # Send OpenClaw test message
 python3 bot.py --test --package hermes-agent
+python3 bot.py --test --package all
 ```
 
 ## Tests
 
 ```bash
-python3 test_format.py   # unit tests for the Markdown→Telegram-HTML converter
+python3 test_format.py   # Markdown→Telegram-HTML converter
+python3 test_watch.py    # version matching, GitHub tag prefixes, prerelease flags
 ```
 
-Stdlib-only asserts, no test framework. Covers `md_to_telegram_html()`, which
-renders the optional LLM "What's new" summary (Markdown) into the HTML that
-Telegram alerts use — otherwise `**bold**`, `` `code` ``, and `- bullets` would
-show up literally.
+Stdlib-only asserts, no test framework. `test_format.py` covers
+`md_to_telegram_html()`. `test_watch.py` covers the detection helpers that
+decide when OpenClaw / Hermes / Codex / Claude Code should alert.
 
 ## License
 
