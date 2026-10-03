@@ -4,7 +4,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # No third-party deps; bot.py uses only the standard library.
-COPY bot.py ./
+COPY bot.py release_events.py runner.py ./
 
 # Unbuffered stdout so Railway log streaming is live.
 ENV PYTHONUNBUFFERED=1
@@ -14,4 +14,4 @@ ENV PYTHONUNBUFFERED=1
 ENV STATE_DIR=/data \
     STATE_FILE=/data/last-version.txt
 
-CMD ["python3", "bot.py", "--daemon"]
+CMD ["python3", "runner.py"]
