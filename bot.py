@@ -34,7 +34,11 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", str(STATE_FILE.parent)))
 WATCH_PACKAGES = [p.strip() for p in os.environ.get("WATCH_PACKAGES", "openclaw,hermes-agent,codex,claude-code").split(",") if p.strip()]
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/api").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-v4.1-flash")
+# Optional second model. Unset uses this default; set to empty to skip the retry.
+OLLAMA_MODEL_FALLBACK = os.environ.get("OLLAMA_MODEL_FALLBACK", "glm-5.3-flash")
+# Release summaries stay at or below 0.2 so wording does not drift from the notes.
+OLLAMA_TEMPERATURE = 0.2
 
 
 def _int_env(name: str, default: int) -> int:
@@ -379,50 +383,171 @@ def extract_plain_excerpt(body: str, limit: int = 4) -> list[str]:
     return lines
 
 
+# Version and integer tokens. Boundaries keep 1.2.3 from matching inside
+# 1.2.30 or 11.2.3. A sentence period after a token is allowed; a dotted or
+# prerelease continuation is not. v / rust-v prefixes share a core with the
+# bare number so "v1.2.3" and "1.2.3" are the same fact.
+# Prerelease suffixes stop before a sentence period ("1.2.3-beta.").
+_VERSION_SUFFIX = r"[-+][0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*"
+_NUMBER_TOKEN_RE = re.compile(
+    r"(?<![\w.])(?:"
+    rf"(?P<prefix>rust-v|v)(?P<prefixed>\d+(?:\.\d+)*(?:{_VERSION_SUFFIX})*)"
+    rf"|(?P<dotted>\d+(?:\.\d+)+(?:{_VERSION_SUFFIX})*)"
+    r"|(?P<integer>\d+)"
+    r")(?![\w]|[.](?=\d))",
+    re.IGNORECASE,
+)
+
+
+def _summary_number_tokens(text: str) -> list[tuple[str, str, str]]:
+    """Return (raw, kind, core) for number and version tokens, in order."""
+    found: list[tuple[str, str, str]] = []
+    for match in _NUMBER_TOKEN_RE.finditer(text or ""):
+        if match.group("prefixed") is not None:
+            found.append((match.group(0), "version", match.group("prefixed")))
+        elif match.group("dotted") is not None:
+            found.append((match.group(0), "version", match.group("dotted")))
+        else:
+            found.append((match.group(0), "integer", match.group("integer")))
+    return found
+
+
+def ungrounded_summary_numbers(summary: str, source: str) -> list[str]:
+    """Number/version strings in `summary` that do not appear in `source`.
+
+    Comparison is on the numeric core, so an optional v / rust-v prefix does
+    not by itself count as a different fact. Components of a version are not
+    treated as standalone integers: "3" is not grounded by "1.2.3".
+    """
+    source_versions: set[str] = set()
+    source_integers: set[str] = set()
+    for _raw, kind, core in _summary_number_tokens(source):
+        if kind == "version":
+            source_versions.add(core)
+        else:
+            source_integers.add(core)
+
+    allowed_versions = source_versions | source_integers
+    allowed_integers = source_integers | {core for core in source_versions if core.isdigit()}
+
+    bad: list[str] = []
+    seen: set[str] = set()
+    for raw, kind, core in _summary_number_tokens(summary):
+        allowed = allowed_versions if kind == "version" else allowed_integers
+        if core in allowed or raw in seen:
+            continue
+        seen.add(raw)
+        bad.append(raw)
+    return bad
+
+
+def release_summary_prompt(label: str, source_parts: list[str]) -> str:
+    """Facts-only prompt. The instruction text itself contains no numbers."""
+    return (
+        f"Summarize this {label} release for a Telegram product update.\n"
+        "Write concise bullets under the heading \"What's new\".\n"
+        "Use only facts stated in the source text below. "
+        "Copy versions and numbers verbatim. "
+        "Keep the source's verbs. "
+        "Do not add hype or opinion words. "
+        "Do not speculate about impact.\n\n"
+        + "\n\n".join(source_parts)
+    )
+
+
+def _model_reply_text(data: dict | None) -> str:
+    """Text we would send. Reasoning-only payloads count as empty."""
+    if not isinstance(data, dict):
+        return ""
+    raw = data.get("response")
+    if not isinstance(raw, str):
+        return ""
+    lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
+    return "\n".join(lines[:6])[:1200]
+
+
+def _generate_summary(model: str, prompt: str) -> str:
+    """Call /api/generate once. Empty string means timeout, HTTP error, or no text."""
+    data = post_json(
+        f"{OLLAMA_BASE_URL}/generate",
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": OLLAMA_TEMPERATURE},
+        },
+        timeout=SUMMARY_TIMEOUT,
+        headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
+        warn=False,
+    )
+    if data is None:
+        print(f"[WARN] Ollama model {model} request failed")
+        return ""
+    text = _model_reply_text(data)
+    if not text:
+        print(f"[WARN] Ollama model {model} returned an empty reply")
+        return ""
+    return text
+
+
+def _accept_summary(model: str, text: str, fact_text: str) -> str:
+    """Return `text` when every number is in the source; otherwise empty."""
+    bad = ungrounded_summary_numbers(text, fact_text)
+    if bad:
+        shown = ", ".join(bad[:8])
+        print(f"[WARN] Ollama model {model} summary has number(s) not in the source: {shown}")
+        return ""
+    print(f"[OK] Release summary answered by {model}")
+    return text
+
+
 def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
-    """Return an optional LLM summary. Empty string means use normal changelog fallback."""
+    """Return an optional LLM summary. Empty string means use normal changelog fallback.
+
+    Tries OLLAMA_MODEL, then OLLAMA_MODEL_FALLBACK once, when the primary times
+    out, returns an HTTP error, replies with no summary text, or includes a
+    number/version that is not in the source. If both attempts fail, the caller
+    sends the alert with the parsed changelog only.
+    """
     if not OLLAMA_API_KEY:
         return ""
 
-    body = (gh_release or {}).get("body", "").strip()
+    body = ((gh_release or {}).get("body") or "").strip()
     description = (npm_info.get("description") or "").strip()
     if not body and not description:
         return ""
 
-    config = package_config(package_key)
+    clipped = body[:6000]
     source_parts = []
     if description:
         source_parts.append(f"npm description:\n{description}")
-    if body:
-        source_parts.append(f"GitHub release notes:\n{body[:6000]}")
+    if clipped:
+        source_parts.append(f"GitHub release notes:\n{clipped}")
+    fact_text = "\n".join(part for part in (description, clipped) if part)
+    prompt = release_summary_prompt(package_config(package_key)["label"], source_parts)
 
-    prompt = (
-        f"Summarize this {config['label']} release for a Telegram product update.\n"
-        "Write 2-4 concise bullets under the heading \"What's new\". "
-        "Focus on user-visible changes, fixes, and upgrade-relevant notes. "
-        "Do not invent details.\n\n"
-        + "\n\n".join(source_parts)
-    )
+    primary = (OLLAMA_MODEL or "").strip()
+    fallback = (OLLAMA_MODEL_FALLBACK or "").strip()
+    # At most two calls. A fallback that names the same model still retries once.
+    models: list[str] = []
+    if primary:
+        models.append(primary)
+    if fallback:
+        models.append(fallback)
 
-    data = post_json(
-        f"{OLLAMA_BASE_URL}/generate",
-        {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=SUMMARY_TIMEOUT,
-        headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
-    )
-    if not data:
-        return ""
+    saw_ungrounded = False
+    for model in models:
+        text = _generate_summary(model, prompt)
+        if not text:
+            continue
+        kept = _accept_summary(model, text, fact_text)
+        if kept:
+            return kept
+        saw_ungrounded = True
 
-    summary = (data.get("response") or "").strip()
-    if not summary:
-        return ""
-
-    lines = [line.rstrip() for line in summary.splitlines() if line.strip()]
-    return "\n".join(lines[:6])[:1200]
+    if saw_ungrounded:
+        print("[WARN] Dropping release summary")
+    return ""
 
 
 def format_release_message(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
