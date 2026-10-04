@@ -69,10 +69,11 @@ python3 bot.py --status
 | `WATCH_PRERELEASES` | No | package defaults (OpenClaw on) | `all`, `none`, or CSV of package keys. Overrides which GitHub prereleases are treated as new versions. |
 | `OLLAMA_API_KEY` | No | — | Enables optional release summaries through the Ollama generate API. Leave unset to use normal changelog formatting only. |
 | `OLLAMA_BASE_URL` | No | `https://ollama.com/api` | Ollama API base URL. |
-| `OLLAMA_MODEL` | No | `gpt-oss:20b` | Model name sent to Ollama. |
-| `SUMMARY_TIMEOUT` | No | `30` | Seconds to wait for the optional summary before falling back. |
+| `OLLAMA_MODEL` | No | `deepseek-v4.1-flash` | Primary model name sent to Ollama. A value already set in the service environment overrides this default. |
+| `OLLAMA_MODEL_FALLBACK` | No | `glm-5.3-flash` | Tried once when the primary times out, returns an HTTP error, returns an empty reply, or includes a number that is not in the source. Set to empty to skip that retry. |
+| `SUMMARY_TIMEOUT` | No | `30` | Seconds to wait for each summary request before trying the fallback or sending the alert without a summary. |
 
-The summary path is optional and fail-closed: if `OLLAMA_API_KEY` is missing, the API times out, or the model returns an empty response, alerts use the existing parsed changelog and metadata without crashing.
+The summary path is optional and fail-closed. The prompt asks for facts from the release notes only: versions and numbers copied verbatim, the source's verbs, no hype or opinion, and no speculation about impact. Sampling temperature is `0.2`. A reply that only fills reasoning fields counts as empty. If the summary contains a number or version that is not in the npm description or GitHub release notes, the fallback model is tried once; if that attempt also fails the check, the alert goes out without the summary. If `OLLAMA_API_KEY` is missing, or both models fail, alerts use the existing parsed changelog and metadata without crashing. The log line `Release summary answered by <model>` names which model produced the summary.
 
 ## Deployment notes
 
@@ -103,13 +104,15 @@ python3 bot.py --test --package all
 ## Tests
 
 ```bash
-python3 test_format.py   # Markdown→Telegram-HTML converter
-python3 test_watch.py    # version matching, GitHub tag prefixes, prerelease flags
+python3 test_format.py    # Markdown→Telegram-HTML converter
+python3 test_watch.py     # version matching, GitHub tag prefixes, prerelease flags
+python3 test_summary.py   # summary fallback and invented-number guard
 ```
 
 Stdlib-only asserts, no test framework. `test_format.py` covers
 `md_to_telegram_html()`. `test_watch.py` covers the detection helpers that
 decide when OpenClaw / Hermes / Codex / Claude Code should alert.
+`test_summary.py` covers the Ollama fallback and the number guard.
 
 ## License
 
