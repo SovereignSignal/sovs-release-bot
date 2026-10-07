@@ -10,7 +10,6 @@ It is not exactly-once. A send can succeed and the process can die before
 from __future__ import annotations
 
 import hmac
-import html
 import json
 import os
 import re
@@ -180,26 +179,35 @@ def _validate_url(url: str) -> str:
 
 
 def format_event(event: dict) -> str:
-    """Telegram HTML, at most 4096 characters, with quotes escaped."""
+    """Telegram HTML, at most 4096 characters, with quotes escaped.
+
+    The summary is cleaned the same way as a polled release: plain bullets,
+    no raw Markdown, and no partial word left over from an upstream clip.
+    """
     icon = "🤖" if str(event.get("kind") or "").strip() == "model" else "🚀"
     name = str(event.get("name") or "").strip()
     version = str(event.get("version") or "").strip()
-    summary = str(event.get("summary") or "").strip()[:MAX_SUMMARY]
+    notes = str(event.get("summary") or "").strip()[:MAX_SUMMARY]
     url = str(event.get("url") or "").strip()
-    summary = _shrink(summary, lambda text: _compose(icon, name, version, text, url))
-    message = _compose(icon, name, version, summary, url)
+    summary = bot.alert_body(name, version, notes) if notes else ""
+
+    def build(text: str) -> str:
+        return bot.compose_alert_html(icon, name, version, text, url)
+
+    summary = bot.fit_text_to_message(summary, build, TELEGRAM_MAX)
+    message = build(summary)
     if len(message) <= TELEGRAM_MAX:
         return message
-    url = _shrink(url, lambda text: _compose(icon, name, version, "", text))
-    message = _compose(icon, name, version, "", url)
+    url = _shrink(url, lambda text: bot.compose_alert_html(icon, name, version, "", text))
+    message = bot.compose_alert_html(icon, name, version, "", url)
     if len(message) <= TELEGRAM_MAX:
         return message
-    name = _shrink(name, lambda text: _compose(icon, text, version, "", url), strip=False)
-    message = _compose(icon, name, version, "", url)
+    name = _shrink(name, lambda text: bot.compose_alert_html(icon, text, version, "", url), strip=False)
+    message = bot.compose_alert_html(icon, name, version, "", url)
     if len(message) <= TELEGRAM_MAX:
         return message
-    version = _shrink(version, lambda text: _compose(icon, name, text, "", url), strip=False)
-    return _compose(icon, name, version, "", url)
+    version = _shrink(version, lambda text: bot.compose_alert_html(icon, name, text, "", url), strip=False)
+    return bot.compose_alert_html(icon, name, version, "", url)
 
 
 def _shrink(raw: str, build, strip: bool = True) -> str:
@@ -217,18 +225,6 @@ def _shrink(raw: str, build, strip: bool = True) -> str:
             high = mid - 1
     kept = raw[:best]
     return kept.rstrip() if strip else kept
-
-
-def _compose(icon: str, name: str, version: str, summary: str, url: str) -> str:
-    name_esc = html.escape(name, quote=True)
-    version_esc = html.escape(version, quote=True)
-    summary_esc = html.escape(summary, quote=True)
-    url_esc = html.escape(url, quote=True)
-    message = f"{icon} <b>{name_esc} {version_esc}</b>"
-    if summary_esc:
-        message += f"\n\n{summary_esc}"
-    message += f'\n\n🔗 <a href="{url_esc}">Release</a>'
-    return message
 
 
 def html_to_plain(text: str) -> str:

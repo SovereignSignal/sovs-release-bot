@@ -7,12 +7,11 @@ Telegram bot that alerts when new **OpenClaw**, **Hermes Agent**, **Codex**, and
 - Monitors configured npm `latest` tags **and** GitHub releases every 30 minutes (configurable)
 - OpenClaw prereleases are on by default (their `latest` npm tag has been stale while betas ship); Codex/Hermes/Claude Code alert on stables unless you set `WATCH_PRERELEASES`
 - When a new version is detected → sends a Telegram alert with:
-  - Package name
-  - Version number
-  - Optional LLM-generated "What's new" summary when configured
-  - Publish timestamp
-  - Docker image tag when available
-  - GitHub release notes (if available)
+  - Package name and version
+  - A short plain summary (a few bullets). An LLM summary is used when configured and every number in it appears in the source; otherwise the first few cleaned release-note bullets are used
+  - Publish time in Eastern Time when a timestamp is available
+  - Docker image tag when the package has one
+  - A Release notes link
 - Zero dependencies (stdlib only)
 
 ## Deploy on Railway
@@ -67,13 +66,13 @@ python3 bot.py --status
 | `STATE_DIR` | No | `/opt/sovs-release-bot/data` | State directory for non-OpenClaw packages |
 | `WATCH_PACKAGES` | No | `openclaw,hermes-agent,codex,claude-code` | Comma-separated package keys or npm package names |
 | `WATCH_PRERELEASES` | No | package defaults (OpenClaw on) | `all`, `none`, or CSV of package keys. Overrides which GitHub prereleases are treated as new versions. |
-| `OLLAMA_API_KEY` | No | — | Enables optional release summaries through the Ollama generate API. Leave unset to use normal changelog formatting only. |
+| `OLLAMA_API_KEY` | No | — | Enables optional release summaries through the Ollama generate API. Leave unset to send the cleaned release-note bullets only. |
 | `OLLAMA_BASE_URL` | No | `https://ollama.com/api` | Ollama API base URL. |
 | `OLLAMA_MODEL` | No | `deepseek-v4.1-flash` | Primary model name sent to Ollama. A value already set in the service environment overrides this default. |
 | `OLLAMA_MODEL_FALLBACK` | No | `glm-5.3-flash` | Tried once when the primary times out, returns an HTTP error, returns an empty reply, or includes a number that is not in the source. Set to empty to skip that retry. |
 | `SUMMARY_TIMEOUT` | No | `30` | Seconds to wait for each summary request before trying the fallback or sending the alert without a summary. |
 
-The summary path is optional and fail-closed. The prompt asks for facts from the release notes only: versions and numbers copied verbatim, the source's verbs, no hype or opinion, and no speculation about impact. Sampling temperature is `0.2`. A reply that only fills reasoning fields counts as empty. If the summary contains a number or version that is not in the npm description or GitHub release notes, the fallback model is tried once; if that attempt also fails the check, the alert goes out without the summary. If `OLLAMA_API_KEY` is missing, or both models fail, alerts use the existing parsed changelog and metadata without crashing. The log line `Release summary answered by <model>` names which model produced the summary.
+The summary path is optional and fail-closed. The prompt asks for facts from the release notes only: versions and numbers copied verbatim, the source's verbs, no hype or opinion, and no speculation about impact. Sampling temperature is `0.2`. A reply that only fills reasoning fields counts as empty. If the summary contains a number or version that is not in the npm description or GitHub release notes, the fallback model is tried once; if that attempt also fails the check, the alert goes out without the model summary. If `OLLAMA_API_KEY` is missing, or both models fail, the alert still sends a few cleaned bullets from the release notes (Markdown removed, cut on a sentence or bullet) instead of a raw changelog. The npm package description is not repeated on every alert. The log line `Release summary answered by <model>` names which model produced the summary. Forwarded inbox events use this same summary and the same alert layout.
 
 ## Deployment notes
 
@@ -104,7 +103,7 @@ python3 bot.py --test --package all
 ## Tests
 
 ```bash
-python3 test_format.py    # Markdown→Telegram-HTML converter
+python3 test_format.py    # Markdown conversion and the shared alert layout
 python3 test_watch.py     # version matching, GitHub tag prefixes, prerelease flags
 python3 test_summary.py   # summary fallback and invented-number guard
 ```

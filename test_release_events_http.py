@@ -32,6 +32,8 @@ os.environ.pop("PORT", None)
 import bot
 import release_events
 
+bot.OLLAMA_API_KEY = ""
+
 release_events.wire(bot)
 
 _ORIGINAL_URL_OPEN = urllib.request.urlopen

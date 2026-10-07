@@ -2,7 +2,7 @@
 
 The inbox accepts qualified software and model events at `POST /v1/releases` and delivers at most one Telegram message per caller `id` for the life of the ledger. The legacy npm/GitHub poller is unchanged and still owns OpenClaw, Hermes Agent, Codex, and Claude Code during migration.
 
-Summaries and release notes are untrusted text. They are escaped, truncated, and sent. They are never executed and never written to the log.
+Summaries and release notes are untrusted text. Markdown is stripped, the text is shortened to a few plain bullets, then escaped and sent. They are never executed and never written to the log.
 
 This is not exactly-once delivery. See the crash window below.
 
@@ -93,7 +93,11 @@ Startup does not auto-resend `pending` or `unknown`. Do not describe this inbox 
 
 ## Rendering
 
-Name, version, summary, and the href are passed through `html.escape(..., quote=True)`, so `"`, `'`, `&`, `<`, and `>` cannot break the HTML. The href is still only reached for URLs that already passed validation. The message is shortened until it is at most 4096 characters without cutting an escape sequence or leaving an unclosed tag. `bot.send_telegram` still does its own HTML-then-plain retry. If that call returns false, the inbox tries one plain-text version (tags stripped, `&amp;` `&lt;` `&gt;` decoded) and does not try a third time.
+An inbox alert uses the same layout as a polled release: a bold name and version, at most three plain bullets, and a `Release notes` link to the event URL.
+
+The summary is untrusted. Headings, emphasis, inline code, and Markdown links are stripped before escaping, so the chat does not show literal `###`, `**`, or `[label](url)`. Pull-request and commit links are dropped. A leading heading that repeats the alert title is dropped. When `OLLAMA_API_KEY` is set, the same facts-only summary path as the poller runs first (numbers must appear in the notes or the announced version). If that summary is missing or rejected, the alert keeps the first few cleaned bullets. A cut that would land mid-sentence or mid-word moves back to the previous sentence or bullet and adds an ellipsis. Upstream producers may already clip note text; this receiver does not try to recover the missing tail.
+
+Name, version, the plain summary, and the href are passed through `html.escape(..., quote=True)`, so `"`, `'`, `&`, `<`, and `>` cannot break the HTML. The href is still only reached for URLs that already passed validation. The message is shortened until it is at most 4096 characters without cutting an escape sequence, an alphanumeric word, or leaving an unclosed tag. `bot.send_telegram` still does its own HTML-then-plain retry. If that call returns false, the inbox tries one plain-text version (tags stripped, `&amp;` `&lt;` `&gt;` decoded) and does not try a third time.
 
 ## Process supervision
 
