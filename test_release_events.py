@@ -66,6 +66,7 @@ def reset():
             path.unlink()
     CALLS.clear()
     bot.send_telegram = fake_ok
+    bot.OLLAMA_API_KEY = ""
 
 
 def event(**overrides):
@@ -100,6 +101,7 @@ def test_existing_contract():
     assert r.validate(good) == ""
     assert r.canonical_id(good) == good["id"]
     assert "Thing 1.0" in r.format_event(good)
+    assert "Release notes</a>" in r.format_event(good)
     bad = dict(good)
     bad["kind"] = "paper"
     assert r.validate(bad) == "invalid kind"

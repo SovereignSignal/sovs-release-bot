@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -21,8 +22,10 @@ import sys
 import time
 import urllib.request
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -445,7 +448,8 @@ def release_summary_prompt(label: str, source_parts: list[str]) -> str:
     """Facts-only prompt. The instruction text itself contains no numbers."""
     return (
         f"Summarize this {label} release for a Telegram product update.\n"
-        "Write concise bullets under the heading \"What's new\".\n"
+        "Write concise plain-text bullets under the heading \"What's new\".\n"
+        "Do not use Markdown headings or emphasis.\n"
         "Use only facts stated in the source text below. "
         "Copy versions and numbers verbatim. "
         "Keep the source's verbs. "
@@ -501,31 +505,11 @@ def _accept_summary(model: str, text: str, fact_text: str) -> str:
     return text
 
 
-def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
-    """Return an optional LLM summary. Empty string means use normal changelog fallback.
-
-    Tries OLLAMA_MODEL, then OLLAMA_MODEL_FALLBACK once, when the primary times
-    out, returns an HTTP error, replies with no summary text, or includes a
-    number/version that is not in the source. If both attempts fail, the caller
-    sends the alert with the parsed changelog only.
-    """
-    if not OLLAMA_API_KEY:
+def _summarize_fact_text(label: str, fact_text: str, source_parts: list[str]) -> str:
+    """Try the primary model, then the fallback once. Empty means use the notes."""
+    if not OLLAMA_API_KEY or not (fact_text or "").strip():
         return ""
-
-    body = ((gh_release or {}).get("body") or "").strip()
-    description = (npm_info.get("description") or "").strip()
-    if not body and not description:
-        return ""
-
-    clipped = body[:6000]
-    source_parts = []
-    if description:
-        source_parts.append(f"npm description:\n{description}")
-    if clipped:
-        source_parts.append(f"GitHub release notes:\n{clipped}")
-    fact_text = "\n".join(part for part in (description, clipped) if part)
-    prompt = release_summary_prompt(package_config(package_key)["label"], source_parts)
-
+    prompt = release_summary_prompt(label, source_parts)
     primary = (OLLAMA_MODEL or "").strip()
     fallback = (OLLAMA_MODEL_FALLBACK or "").strip()
     # At most two calls. A fallback that names the same model still retries once.
@@ -550,91 +534,97 @@ def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None)
     return ""
 
 
+def summarize_notes(label: str, notes: str, version: str = "") -> str:
+    """Summarize forwarded release notes.
+
+    ``version`` is included as a source fact so the announced version is not
+    treated as invented. Numbers still have to appear in the notes or version.
+    """
+    clipped = (notes or "").strip()[:6000]
+    version = (version or "").strip()
+    if not clipped and not version:
+        return ""
+    source_parts: list[str] = []
+    fact_bits: list[str] = []
+    if version:
+        source_parts.append(f"Version:\n{version}")
+        fact_bits.append(version)
+    if clipped:
+        source_parts.append(f"Release notes:\n{clipped}")
+        fact_bits.append(clipped)
+    return _summarize_fact_text(label or "release", "\n".join(fact_bits), source_parts)
+
+
+def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
+    """Return an optional LLM summary. Empty string means use the plain-notes fallback.
+
+    Tries OLLAMA_MODEL, then OLLAMA_MODEL_FALLBACK once, when the primary times
+    out, returns an HTTP error, replies with no summary text, or includes a
+    number/version that is not in the source. If both attempts fail, the caller
+    sends the alert with a few cleaned bullets from the release notes.
+    """
+    if not OLLAMA_API_KEY:
+        return ""
+
+    body = ((gh_release or {}).get("body") or "").strip()
+    description = (npm_info.get("description") or "").strip()
+    if not body and not description:
+        return ""
+
+    clipped = body[:6000]
+    source_parts = []
+    if description:
+        source_parts.append(f"npm description:\n{description}")
+    if clipped:
+        source_parts.append(f"GitHub release notes:\n{clipped}")
+    fact_text = "\n".join(part for part in (description, clipped) if part)
+    return _summarize_fact_text(package_config(package_key)["label"], fact_text, source_parts)
+
+
 def format_release_message(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
-    """Format the release alert message with changelog summary."""
+    """Alert with the same shape as a forwarded release: header, short summary, link."""
     config = package_config(package_key)
-    version = npm_info["version"]
-    published = npm_info["published"]
+    version = str(npm_info["version"])
+    published = str(npm_info.get("published") or "")
     package_name = npm_info.get("package") or config["npm"]
     repo = config.get("github")
-    gh_url = gh_release.get("html_url") if gh_release else ""
+    gh_url = (gh_release or {}).get("html_url") or ""
     repo_url = f"https://github.com/{repo}" if repo else ""
-    docker_tag = config.get("docker", "").format(version=version) if config.get("docker") else ""
+    docker_tmpl = config.get("docker") or ""
+    docker_tag = docker_tmpl.format(version=version) if docker_tmpl else ""
     prerelease = bool(gh_release and gh_release.get("prerelease"))
+    body = (gh_release or {}).get("body") or ""
+    description = (npm_info.get("description") or "").strip()
+    label = str(config["label"])
+    title = f"{label} {version}".strip()
 
-    msg = f"{config['emoji']} <b>{_esc(config['label'])} {version}</b>"
-    if prerelease:
-        msg += " <i>(pre-release)</i>"
-    msg += "\n\n"
-    if npm_info.get("description"):
-        msg += f"{_esc(npm_info['description'])}\n\n"
+    llm = summarize_release(package_key, npm_info, gh_release)
+    summary = plain_alert_text(llm, title=title, version=version) if llm else ""
+    if not summary:
+        summary = plain_alert_text(body, title=title, version=version)
+    # The npm blurb is the same on every version. Use it only when the notes
+    # and the model summary are both empty.
+    if not summary and description:
+        summary = plain_alert_text(description, title=title, version=version)
 
-    llm_summary = summarize_release(package_key, npm_info, gh_release)
-    if llm_summary:
-        msg += f"{md_to_telegram_html(llm_summary)}\n\n"
+    npm_url = f"https://www.npmjs.com/package/{_url_package(package_name)}/v/{version}"
+    release_url = gh_url or repo_url or npm_url
 
-    body = gh_release.get("body", "") if gh_release else ""
-    changelog = parse_changelog(body)
+    def build(text: str) -> str:
+        return compose_alert_html(
+            config["emoji"],
+            label,
+            version,
+            text,
+            release_url,
+            published=published,
+            docker=docker_tag,
+            prerelease=prerelease,
+            npm_url=npm_url,
+        )
 
-    if changelog["summary"]:
-        msg += f"ℹ️ {_esc(changelog['summary'])}\n\n"
-
-    if changelog["breaking"]:
-        msg += "🚨 <b>Breaking:</b>\n"
-        for item in changelog["breaking"][:5]:
-            msg += f"  • {_esc(item)}\n"
-        msg += "\n"
-
-    if changelog["features"]:
-        msg += "✨ <b>Features:</b>\n"
-        for item in changelog["features"][:5]:
-            msg += f"  • {_esc(item)}\n"
-        if len(changelog["features"]) > 5:
-            msg += f"  <i>...and {len(changelog['features']) - 5} more</i>\n"
-        msg += "\n"
-
-    if changelog["fixes"]:
-        msg += "🔧 <b>Fixes:</b>\n"
-        for item in changelog["fixes"][:5]:
-            msg += f"  • {_esc(item)}\n"
-        if len(changelog["fixes"]) > 5:
-            msg += f"  <i>...and {len(changelog['fixes']) - 5} more</i>\n"
-        msg += "\n"
-
-    if changelog["other"]:
-        if len(changelog["other"]) <= 3:
-            msg += "📦 <b>Other:</b>\n"
-            for item in changelog["other"]:
-                msg += f"  • {_esc(item)}\n"
-            msg += "\n"
-        else:
-            msg += f"📦 +{len(changelog['other'])} other changes\n\n"
-    elif changelog.get("excerpt") and not llm_summary:
-        msg += "📝 <b>Notes:</b>\n"
-        for item in changelog["excerpt"][:4]:
-            msg += f"  • {_esc(item)}\n"
-        msg += "\n"
-
-    stats = []
-    if changelog["pr_count"]:
-        stats.append(f"{changelog['pr_count']} PRs")
-    if changelog["contributors"]:
-        stats.append(f"{len(changelog['contributors'])} contributors")
-    if stats:
-        msg += f"📊 {' · '.join(stats)}\n"
-
-    links = [f"<a href=\"https://www.npmjs.com/package/{_url_package(package_name)}/v/{version}\">npm</a>"]
-    if gh_url:
-        links.insert(0, f"<a href=\"{gh_url}\">Release Notes</a>")
-    elif repo_url:
-        links.append(f"<a href=\"{repo_url}\">GitHub</a>")
-    msg = msg.rstrip() + "\n\n"
-    msg += f"📦 Published: {published}\n"
-    if docker_tag:
-        msg += f"🐳 <code>{docker_tag}</code>\n"
-    msg += f"🔗 {' · '.join(links)}"
-
-    return msg
+    summary = fit_text_to_message(summary, build)
+    return build(summary)
 
 
 def _url_package(package_name: str) -> str:
@@ -647,6 +637,416 @@ def _esc(text: str) -> str:
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
+
+
+ELLIPSIS = "…"
+MAX_ALERT_BULLETS = 3
+_HARD_CUT_CHARS = 160
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_BULLET_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+(.*)$")
+_HEADING_RE = re.compile(r"^#{1,6}\s+")
+_RULE_RE = re.compile(r"^[-*_]{3,}$")
+_SENTENCE_END_RE = re.compile(r"[.!?…](?:[\"')\]]+)?(?=\s|$)")
+_PR_LINK_RE = re.compile(r"\[#\d+\]\([^)\s]*\)")
+_COMMIT_LINK_RE = re.compile(r"\[`?[0-9a-fA-F]{7,40}`?\]\([^)\s]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)\n]*\)")
+_UNCLOSED_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*$|\[[^\]]*$")
+_COMMIT_PREFIX_RE = re.compile(
+    r"^(?:feat|fix|chore|docs|refactor|perf|test|ci|build|style)(?:\([^)]*\))?:\s*",
+    re.IGNORECASE,
+)
+_PR_SUFFIX_RE = re.compile(r"\s+by\s+@\S+\s+in\s+https://\S+", re.IGNORECASE)
+_CLIPPED_HYPHEN_RE = re.compile(r"-[A-Za-z0-9]{1,2}$")
+_LABEL_LINES = {"what's new", "whats new"}
+
+
+def format_published(value: str) -> str:
+    """Readable Eastern Time, or a calendar date when no clock time was given.
+
+    Unparseable values are dropped so a raw UTC timestamp never reaches Telegram.
+    """
+    raw = (value or "").strip()
+    if not raw or raw.casefold() == "unknown":
+        return ""
+    has_time = "T" in raw or bool(re.search(r"\d:\d", raw))
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return ""
+    if not has_time:
+        return f"{_MONTHS[parsed.month - 1]} {parsed.day}, {parsed.year}"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        local = parsed.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return ""
+    hour12 = local.hour % 12 or 12
+    ampm = "AM" if local.hour < 12 else "PM"
+    return f"{_MONTHS[local.month - 1]} {local.day}, {hour12}:{local.minute:02d} {ampm} ET"
+
+
+def _norm_heading(text: str) -> str:
+    text = re.sub(r"^#+\s*", "", text or "")
+    text = re.sub(r"[*_`]", "", text)
+    text = text.replace("’", "'").replace("‘", "'")
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return re.sub(r"\bv(?=\d)", "", text)
+
+
+def _duplicates_title(text: str, title: str, version: str) -> bool:
+    heading = _norm_heading(text)
+    if not heading:
+        return False
+    if version:
+        bare = version.strip().casefold().lstrip("v")
+        if heading == bare:
+            return True
+    named = _norm_heading(title)
+    return bool(named) and heading == named
+
+
+def _ends_sentence(text: str) -> bool:
+    return re.search(r"[.!?…][\"')\]]*$", (text or "").rstrip()) is not None
+
+
+def _sentence_pieces(text: str) -> list[tuple[str, bool]]:
+    text = (text or "").strip()
+    pieces: list[tuple[str, bool]] = []
+    start = 0
+    for match in _SENTENCE_END_RE.finditer(text):
+        chunk = text[start:match.end()].strip()
+        if chunk:
+            pieces.append((chunk, True))
+        start = match.end()
+        while start < len(text) and text[start].isspace():
+            start += 1
+    tail = text[start:].strip()
+    if tail:
+        pieces.append((tail, False))
+    if not pieces and text:
+        pieces.append((text, False))
+    return pieces
+
+
+def _has_unclosed_link(text: str) -> bool:
+    return _UNCLOSED_LINK_RE.search(text or "") is not None
+
+
+def _link_label(label: str) -> str:
+    bare = label.strip().strip("`").strip()
+    if re.fullmatch(r"#\d+", bare) or re.fullmatch(r"[0-9a-fA-F]{7,40}", bare):
+        return ""
+    return bare
+
+
+def _strip_md_links(text: str) -> str:
+    text = _PR_LINK_RE.sub(" ", text)
+    text = _COMMIT_LINK_RE.sub(" ", text)
+    text = _MD_LINK_RE.sub(lambda match: _link_label(match.group(1)), text)
+    text = re.sub(r"\[[^\]]*\]\([^)\n]*$", " ", text)
+    text = re.sub(r"\[[^\]]*$", " ", text)
+    return text
+
+
+def _strip_inline_md(text: str) -> str:
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = _strip_md_links(text)
+    text = re.sub(r"<(https?://[^>\s]+)>", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]*)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]*)__", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = text.replace("**", "").replace("__", "")
+    text = _PR_SUFFIX_RE.sub(" ", text)
+    text = re.sub(r"\(\s*\)", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:[•·]\s*)+", "", text).strip()
+    text = re.sub(r"^(?:[-–—]\s*)+", "", text).strip()
+    text = _COMMIT_PREFIX_RE.sub("", text).strip()
+    return text
+
+
+def _is_boilerplate(text: str) -> bool:
+    bare = (text or "").strip()
+    if not bare:
+        return True
+    if re.match(r"(?i)^(\*\*)?full changelog\b", bare):
+        return True
+    if re.fullmatch(r"https://\S+", bare):
+        return True
+    folded = re.sub(r"[*_`]", "", bare).strip().casefold().replace("’", "'")
+    return folded in _LABEL_LINES
+
+
+def _drop_partial_word(fragment: str) -> str:
+    fragment = fragment.rstrip()
+    if " " not in fragment:
+        return ""
+    head, _last = fragment.rsplit(" ", 1)
+    return head.rstrip(" ,;:-–—")
+
+
+def _dangling_fragment(fragment: str) -> bool:
+    """True when a fragment looks cut off rather than like a short title."""
+    if _has_unclosed_link(fragment):
+        return True
+    if _CLIPPED_HYPHEN_RE.search(fragment):
+        return True
+    return len(fragment) >= _HARD_CUT_CHARS and re.search(r"[A-Za-z0-9]$", fragment) is not None
+
+
+def _tidy_bullet(text: str) -> tuple[str, bool]:
+    """Keep complete sentences. A cut tail becomes an ellipsis."""
+    pieces = _sentence_pieces(text)
+    complete = [part for part, done in pieces if done]
+    incomplete = [part for part, done in pieces if not done]
+    if complete and incomplete:
+        return " ".join(complete).rstrip() + ELLIPSIS, True
+    if complete:
+        return " ".join(complete), False
+    fragment = incomplete[0] if incomplete else ""
+    if not fragment:
+        return "", False
+    if _dangling_fragment(fragment):
+        head = _drop_partial_word(fragment)
+        if not head:
+            return "", True
+        return head + ELLIPSIS, True
+    return fragment, False
+
+
+def _collect_note_items(body: str, title: str, version: str) -> list[tuple[str, bool]]:
+    items: list[str] = []
+    current: str | None = None
+    in_fence = False
+    saw_content = False
+
+    def flush() -> None:
+        nonlocal current
+        if current and current.strip():
+            items.append(current.strip())
+        current = None
+
+    for raw in (body or "").splitlines():
+        if raw.strip().startswith("```"):
+            in_fence = not in_fence
+            flush()
+            continue
+        if in_fence:
+            continue
+        if not raw.strip() or _RULE_RE.match(raw.strip()):
+            flush()
+            continue
+        line = raw.strip()
+        if _HEADING_RE.match(line):
+            flush()
+            text = re.sub(r"^#+\s*", "", line).strip()
+            if _duplicates_title(text, title, version) or _is_boilerplate(text):
+                continue
+            if _ends_sentence(text) and len(text) > 40:
+                items.append(text)
+                saw_content = True
+            continue
+        bold_only = re.fullmatch(r"\*\*([^*]+)\*\*", line) or re.fullmatch(r"__([^_]+)__", line)
+        if bold_only and not _ends_sentence(bold_only.group(1)):
+            flush()
+            continue
+        if _is_boilerplate(line):
+            flush()
+            continue
+        if not saw_content and _duplicates_title(line, title, version):
+            continue
+        bullet = _BULLET_RE.match(line)
+        if bullet:
+            flush()
+            current = bullet.group(1)
+            saw_content = True
+            continue
+        if current is not None and raw[:1] in " \t":
+            current = f"{current} {line}"
+            continue
+        flush()
+        current = line
+        saw_content = True
+    flush()
+
+    prepared: list[tuple[str, bool]] = []
+    for raw_item in items:
+        dangling = _has_unclosed_link(raw_item)
+        text = _strip_inline_md(raw_item)
+        if _is_boilerplate(text) or _duplicates_title(text, title, version):
+            if dangling:
+                prepared.append(("", True))
+            continue
+        prepared.append((text, dangling))
+    return prepared
+
+
+def plain_alert_text(
+    body: str,
+    title: str = "",
+    version: str = "",
+    max_bullets: int = MAX_ALERT_BULLETS,
+) -> str:
+    """A few plain bullets. Markdown is gone. A cut ends on a sentence or bullet."""
+    kept: list[str] = []
+    trimmed_after = False
+    for text, link_cut in _collect_note_items(body, title, version):
+        tidy, sent_cut = _tidy_bullet(text)
+        trimmed = link_cut or sent_cut
+        if not tidy:
+            if trimmed:
+                trimmed_after = True
+                break
+            continue
+        if trimmed and not tidy.endswith(ELLIPSIS):
+            tidy += ELLIPSIS
+        kept.append(tidy)
+        if trimmed or len(kept) >= max_bullets:
+            trimmed_after = trimmed_after or trimmed
+            break
+    if trimmed_after and kept and not kept[-1].endswith(ELLIPSIS):
+        kept[-1] += ELLIPSIS
+    if not kept:
+        return ""
+    return "\n".join(f"• {item}" for item in kept[:max_bullets])
+
+
+def alert_body(name: str, version: str, notes: str) -> str:
+    """Short plain summary. Uses the LLM when every number is in the source."""
+    label = (name or "").strip() or "release"
+    version = (version or "").strip()
+    title = " ".join(part for part in ((name or "").strip(), version) if part)
+    llm = summarize_notes(label, notes or "", version=version)
+    if llm:
+        plain = plain_alert_text(llm, title=title, version=version)
+        if plain:
+            return plain
+    return plain_alert_text(notes or "", title=title, version=version)
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum()
+
+
+def _cuts_word(text: str, index: int) -> bool:
+    if index <= 0 or index >= len(text):
+        return False
+    return _is_word_char(text[index - 1]) and _is_word_char(text[index])
+
+
+def _boundary_end(window: str) -> int:
+    best = 0
+    start = 0
+    while True:
+        nl = window.find("\n", start)
+        if nl < 0:
+            break
+        if nl > best:
+            best = nl
+        start = nl + 1
+    for match in _SENTENCE_END_RE.finditer(window):
+        if match.end() > best:
+            best = match.end()
+    return best
+
+
+def boundary_prefix(text: str, room: int) -> str:
+    """Prefix of at most ``room`` characters on a bullet, sentence, or word edge."""
+    if room >= len(text):
+        return text
+    if room <= 0:
+        return ""
+    best = _boundary_end(text[:room])
+    if best > 0:
+        return text[:best].rstrip()
+    if _cuts_word(text, room):
+        ws = text.rfind(" ", 0, room)
+        if ws > 0:
+            return text[:ws].rstrip()
+        return ""
+    end = room
+    while end > 0 and _cuts_word(text, end):
+        end -= 1
+    if end <= 0:
+        return ""
+    return text[:end].rstrip()
+
+
+def clip_with_ellipsis(text: str, budget: int) -> str:
+    text = (text or "").rstrip()
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    room = budget - len(ELLIPSIS)
+    if room <= 0:
+        return ""
+    kept = boundary_prefix(text, room).rstrip()
+    if not kept or kept == text:
+        return kept if kept == text else ""
+    if kept.endswith(ELLIPSIS):
+        return kept
+    return kept + ELLIPSIS
+
+
+def fit_text_to_message(text: str, build, limit: int = 4096) -> str:
+    """Shorten plain text until ``build(text)`` fits, without cutting a word."""
+    text = (text or "").rstrip()
+    if len(build(text)) <= limit:
+        return text
+    best = ""
+    low = 0
+    high = len(text)
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = clip_with_ellipsis(text, mid)
+        if candidate and len(build(candidate)) <= limit:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def compose_alert_html(
+    icon: str,
+    name: str,
+    version: str,
+    summary: str,
+    url: str,
+    *,
+    published: str = "",
+    docker: str = "",
+    prerelease: bool = False,
+    npm_url: str = "",
+) -> str:
+    """Telegram HTML shared by the poller and the release inbox."""
+    title = " ".join(part for part in ((name or "").strip(), (version or "").strip()) if part)
+    header = f"{icon} <b>{html.escape(title, quote=True)}</b>"
+    if prerelease:
+        header += " <i>(pre-release)</i>"
+    parts = [header]
+    if summary:
+        parts.append(html.escape(summary, quote=True))
+    meta: list[str] = []
+    when = format_published(published)
+    if when:
+        meta.append(html.escape(when, quote=True))
+    if docker:
+        meta.append(f"🐳 <code>{html.escape(docker, quote=True)}</code>")
+    if meta:
+        parts.append("\n".join(meta))
+    links: list[str] = []
+    if url:
+        links.append(f'<a href="{html.escape(url, quote=True)}">Release notes</a>')
+    if npm_url and npm_url != url:
+        links.append(f'<a href="{html.escape(npm_url, quote=True)}">npm</a>')
+    if links:
+        parts.append("🔗 " + " · ".join(links))
+    return "\n\n".join(parts)
 
 
 def md_to_telegram_html(text: str) -> str:

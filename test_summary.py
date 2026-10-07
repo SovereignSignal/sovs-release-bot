@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 
 import bot
+import release_events as inbox
 
 
 PRIMARY = "deepseek-v4.1-flash"
@@ -428,7 +429,11 @@ def test_alert_without_summary_keeps_plain_notes():
             urllib.request.urlopen = original
     ok = True
     ok = expect("plain notes survive both failures", "Fixed the gateway crash." in msg) and ok
-    ok = expect("notes section used", "Notes:" in msg) and ok
+    ok = expect("fallback is a plain bullet", "• Fixed the gateway crash." in msg) and ok
+    ok = expect(
+        "no changelog sections",
+        "Notes:" not in msg and "Features:" not in msg and "Fixes:" not in msg,
+    ) and ok
     ok = check("both models attempted for the alert", _models(calls), [PRIMARY, FALLBACK]) and ok
     return ok
 
@@ -451,7 +456,11 @@ def test_alert_drops_invented_summary():
     ok = expect("alert still includes the notes", "Fixed the gateway crash." in msg) and ok
     ok = expect("invented 9.9.9 omitted", "9.9.9" not in msg) and ok
     ok = expect("invented 8.8.8 omitted", "8.8.8" not in msg) and ok
-    ok = expect("notes section instead of summary", "Notes:" in msg) and ok
+    ok = expect("fallback is a plain bullet", "• Fixed the gateway crash." in msg) and ok
+    ok = expect(
+        "no changelog sections",
+        "Notes:" not in msg and "Features:" not in msg and "Fixes:" not in msg,
+    ) and ok
     ok = check("guard used both models", _models(calls), [PRIMARY, FALLBACK]) and ok
     return ok
 
@@ -471,9 +480,88 @@ def test_grounded_summary_is_in_the_alert():
             urllib.request.urlopen = original
     ok = True
     ok = expect("summary in alert", "Fixed the gateway crash." in msg) and ok
-    ok = expect("plain notes section hidden", "Notes:" not in msg) and ok
+    ok = expect("plain notes section hidden", "Notes:" not in msg and "Features:" not in msg) and ok
     ok = expect("alert log names the model", f"answered by {PRIMARY}" in buf.getvalue()) and ok
     ok = check("single model for a grounded alert", _models(calls), [PRIMARY]) and ok
+    return ok
+
+
+def test_grounded_summary_replaces_changelog_wall():
+    body = (
+        "## What's Changed\n\n"
+        "* feat(ui): Add a button by @ada in https://github.com/a/b/pull/9\n"
+        "* fix(api): Stop the crash by @bea in https://github.com/a/b/pull/10\n"
+    )
+    calls, urlopen = _capture([{"response": "What's new\n- Add a button."}])
+    _use_models()
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        msg = bot.format_release_message(*_release(body))
+    finally:
+        urllib.request.urlopen = original
+    ok = check("one model for a grounded changelog", _models(calls), [PRIMARY]) and True
+    ok = expect("summary bullet is shown", "• Add a button." in msg) and ok
+    ok = expect("raw changelog is not appended", msg.count("Add a button") == 1) and ok
+    ok = expect("no feature section beside the summary", "Features:" not in msg and "Fixes:" not in msg) and ok
+    ok = expect("pr url stays out of the alert", "pull/9" not in msg) and ok
+    return ok
+
+
+def test_forwarded_alert_uses_grounded_summary():
+    notes = "### Changed\n\n- Fixed the gateway crash in 1.2.3.\n- **Extra** detail.\n"
+    calls, urlopen = _capture([
+        {"response": "What's new\n- Fixed the gateway crash in 1.2.3."},
+    ])
+    _use_models()
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        msg = inbox.format_event({
+            "schema": "release-event/v1",
+            "id": "software:github:example:v1",
+            "kind": "software",
+            "name": "Example",
+            "version": "1.2.3",
+            "source": "clawbytes",
+            "url": "https://example.com/r",
+            "summary": notes,
+        })
+    finally:
+        urllib.request.urlopen = original
+    ok = check("forwarded alert calls the summarizer", _models(calls), [PRIMARY]) and True
+    ok = expect("grounded bullet is used", "• Fixed the gateway crash in 1.2.3." in msg) and ok
+    ok = expect("raw heading is not forwarded", "###" not in msg and "**" not in msg) and ok
+    ok = expect("release link is labeled", "Release notes</a>" in msg) and ok
+    return ok
+
+
+def test_forwarded_alert_falls_back_when_numbers_are_invented():
+    notes = "### Changed\n\n- Fixed the gateway crash.\n"
+    calls, urlopen = _capture([
+        {"response": "Ships 9.9.9"},
+        {"response": "Adds 8.8.8"},
+    ])
+    _use_models()
+    original = urllib.request.urlopen
+    urllib.request.urlopen = urlopen
+    try:
+        msg = inbox.format_event({
+            "schema": "release-event/v1",
+            "id": "software:github:example:v1",
+            "kind": "software",
+            "name": "Example",
+            "version": "1.2.3",
+            "source": "clawbytes",
+            "url": "https://example.com/r",
+            "summary": notes,
+        })
+    finally:
+        urllib.request.urlopen = original
+    ok = check("both models tried for a forwarded alert", _models(calls), [PRIMARY, FALLBACK]) and True
+    ok = expect("cleaned bullet remains", "• Fixed the gateway crash." in msg) and ok
+    ok = expect("invented numbers stay out", "9.9.9" not in msg and "8.8.8" not in msg) and ok
+    ok = expect("raw heading stays out", "###" not in msg) and ok
     return ok
 
 
@@ -519,6 +607,9 @@ def main():
         test_alert_without_summary_keeps_plain_notes,
         test_alert_drops_invented_summary,
         test_grounded_summary_is_in_the_alert,
+        test_grounded_summary_replaces_changelog_wall,
+        test_forwarded_alert_uses_grounded_summary,
+        test_forwarded_alert_falls_back_when_numbers_are_invented,
         test_no_key_skips_network,
     ]
     try:
