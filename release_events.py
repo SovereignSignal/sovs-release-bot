@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import ai_wire
 import bot
 
 # Policy knobs from the receiver brief.
@@ -178,11 +179,12 @@ def _validate_url(url: str) -> str:
     return ""
 
 
-def format_event(event: dict) -> str:
-    """Telegram HTML, at most 4096 characters, with quotes escaped.
+def render_event(event: dict) -> tuple[str, str]:
+    """Telegram HTML and the plain summary included in it.
 
     The summary is cleaned the same way as a polled release: plain bullets,
     no raw Markdown, and no partial word left over from an upstream clip.
+    When the message has to drop the summary to fit, the second value is empty.
     """
     icon = "🤖" if str(event.get("kind") or "").strip() == "model" else "🚀"
     name = str(event.get("name") or "").strip()
@@ -197,17 +199,23 @@ def format_event(event: dict) -> str:
     summary = bot.fit_text_to_message(summary, build, TELEGRAM_MAX)
     message = build(summary)
     if len(message) <= TELEGRAM_MAX:
-        return message
+        return message, summary
     url = _shrink(url, lambda text: bot.compose_alert_html(icon, name, version, "", text))
     message = bot.compose_alert_html(icon, name, version, "", url)
     if len(message) <= TELEGRAM_MAX:
-        return message
+        return message, ""
     name = _shrink(name, lambda text: bot.compose_alert_html(icon, text, version, "", url), strip=False)
     message = bot.compose_alert_html(icon, name, version, "", url)
     if len(message) <= TELEGRAM_MAX:
-        return message
+        return message, ""
     version = _shrink(version, lambda text: bot.compose_alert_html(icon, name, text, "", url), strip=False)
-    return bot.compose_alert_html(icon, name, version, "", url)
+    return bot.compose_alert_html(icon, name, version, "", url), ""
+
+
+def format_event(event: dict) -> str:
+    """Telegram HTML, at most 4096 characters, with quotes escaped."""
+    message, _summary = render_event(event)
+    return message
 
 
 def _shrink(raw: str, build, strip: bool = True) -> str:
@@ -563,8 +571,10 @@ def accept_event(event) -> tuple[int, str]:
         _log(eid, "gave_up")
         return 409, "gave_up"
     _log(eid, "received")
+    summary = ""
     try:
-        ok = _deliver(format_event(event))
+        message, summary = render_event(event)
+        ok = _deliver(message)
     except Exception as exc:
         _error(f"delivery error {type(exc).__name__}")
         ok = False
@@ -574,6 +584,7 @@ def accept_event(event) -> tuple[int, str]:
         return 503, "state unavailable"
     if ok:
         _log(eid, "delivered")
+        ai_wire.push_event(event, summary)
         return 202, "accepted"
     _log(eid, "failed")
     if attempts >= MAX_ATTEMPTS:

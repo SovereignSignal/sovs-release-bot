@@ -3,7 +3,8 @@
 Sovs Release Bot — Telegram alerts for new OpenClaw, Hermes, Codex, and Claude Code versions.
 
 Monitors npm registry and GitHub releases. Sends a Telegram message
-with a summary of changes when a new version is published.
+with a summary of changes when a new version is published. When
+AI_WIRE_ENABLED is set, a successful alert is also registered with AI Wire.
 
 Usage:
     python3 bot.py              # Check once and exit
@@ -26,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import ai_wire
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -581,8 +584,8 @@ def summarize_release(package_key: str, npm_info: dict, gh_release: dict | None)
     return _summarize_fact_text(package_config(package_key)["label"], fact_text, source_parts)
 
 
-def format_release_message(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
-    """Alert with the same shape as a forwarded release: header, short summary, link."""
+def build_release_message(package_key: str, npm_info: dict, gh_release: dict | None) -> tuple[str, dict]:
+    """Telegram HTML and the registry item for the same alert."""
     config = package_config(package_key)
     version = str(npm_info["version"])
     published = str(npm_info.get("published") or "")
@@ -624,7 +627,35 @@ def format_release_message(package_key: str, npm_info: dict, gh_release: dict | 
         )
 
     summary = fit_text_to_message(summary, build)
-    return build(summary)
+    tag = str((gh_release or {}).get("tag_name") or "").strip()
+    # The chat link can fall back to the repo. The registry wants the release page.
+    if gh_url:
+        wire_url = gh_url
+    elif tag and repo:
+        wire_url = f"https://github.com/{repo}/releases/tag/{urllib.parse.quote(tag, safe='')}"
+    else:
+        wire_url = npm_url
+    html_message = build(summary)
+    try:
+        item = ai_wire.item_for_poll(
+            package_name=str(package_name),
+            version=version,
+            title=title,
+            summary=summary,
+            url=wire_url,
+            published_at=published,
+            github_repo=str(repo or "") if tag else "",
+            github_tag=tag,
+        )
+    except Exception:
+        item = {}
+    return html_message, item
+
+
+def format_release_message(package_key: str, npm_info: dict, gh_release: dict | None) -> str:
+    """Alert with the same shape as a forwarded release: header, short summary, link."""
+    html_message, _item = build_release_message(package_key, npm_info, gh_release)
+    return html_message
 
 
 def _url_package(package_name: str) -> str:
@@ -1233,16 +1264,27 @@ def check_package(package_key: str) -> bool:
 
     sent_any = False
     new_state = dict(state)
+    sent_items: list[dict] = []
+
+    def persist() -> None:
+        # Record the send before the registry call. A slow or failed push must
+        # not leave the baseline unchanged, or the next cycle would alert again.
+        save_state(package_key, new_state)
+        for item in sent_items:
+            ai_wire.push_item(item)
 
     if npm_new and npm_info:
         print(f"[NEW] {package_key} npm: {state['npm'] or '-'} → {npm_version}")
         gh_for_msg = get_gh_release(package_key, npm_version)
         if not gh_for_msg and gh_newest and release_matches_version(gh_newest, npm_version):
             gh_for_msg = gh_newest
-        if send_telegram(format_release_message(package_key, npm_info, gh_for_msg)):
+        html_message, item = build_release_message(package_key, npm_info, gh_for_msg)
+        if send_telegram(html_message):
             new_state["npm"] = npm_version
             if gh_for_msg and gh_for_msg.get("tag_name"):
                 new_state["github_tag"] = gh_for_msg["tag_name"]
+            if item.get("canonical_key"):
+                sent_items.append(item)
             sent_any = True
         else:
             print(f"[WARN] {package_key}: Telegram send failed for npm {npm_version}; will retry next cycle")
@@ -1256,17 +1298,20 @@ def check_package(package_key: str) -> bool:
         elif not npm_new or not release_matches_version(gh_newest, npm_version):
             print(f"[NEW] {package_key} github: {state['github_tag'] or '-'} → {gh_tag}")
             info = npm_info_from_github(package_key, gh_newest, npm_info)
-            if send_telegram(format_release_message(package_key, info, gh_newest)):
+            html_message, item = build_release_message(package_key, info, gh_newest)
+            if send_telegram(html_message):
                 new_state["github_tag"] = gh_tag
+                if item.get("canonical_key"):
+                    sent_items.append(item)
                 sent_any = True
             else:
                 print(f"[WARN] {package_key}: Telegram send failed for {gh_tag}; will retry next cycle")
-                save_state(package_key, new_state)
+                persist()
                 return sent_any
         else:
             new_state["github_tag"] = gh_tag
 
-    save_state(package_key, new_state)
+    persist()
     return sent_any
 
 

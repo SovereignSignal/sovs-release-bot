@@ -99,6 +99,8 @@ The summary is untrusted. Headings, emphasis, inline code, and Markdown links ar
 
 Name, version, the plain summary, and the href are passed through `html.escape(..., quote=True)`, so `"`, `'`, `&`, `<`, and `>` cannot break the HTML. The href is still only reached for URLs that already passed validation. The message is shortened until it is at most 4096 characters without cutting an escape sequence, an alphanumeric word, or leaving an unclosed tag. `bot.send_telegram` still does its own HTML-then-plain retry. If that call returns false, the inbox tries one plain-text version (tags stripped, `&amp;` `&lt;` `&gt;` decoded) and does not try a third time.
 
+When `AI_WIRE_ENABLED` is on, a `202 accepted` delivery also POSTs the alert to the AI Wire registry after the id is marked `delivered`. Duplicate, owned, and failed deliveries do not push. The private chat has no public post URL, so the item omits `channel_post_url`. A timeout or HTTP error is logged as `ai_wire push failed:` and does not change the HTTP status. Success is `ai_wire push ok n=`.
+
 ## Process supervision
 
 `runner.py` wires `bot` into the inbox, starts `serve()` on a daemon thread, and runs `bot.daemon()` on the main thread. The poller cadence, baselines, and silent first-run behavior are unchanged.

@@ -28,6 +28,9 @@ os.environ["RELEASE_EVENTS_STATE_V2"] = V2
 os.environ["STATE_DIR"] = TMP
 os.environ["STATE_FILE"] = str(Path(TMP) / "last-version.txt")
 os.environ.pop("PORT", None)
+os.environ.pop("AI_WIRE_ENABLED", None)
+os.environ.pop("AI_WIRE_URL", None)
+os.environ.pop("AI_WIRE_INGEST_TOKEN", None)
 
 import bot
 import release_events
