@@ -71,8 +71,13 @@ python3 bot.py --status
 | `OLLAMA_MODEL` | No | `deepseek-v4.1-flash` | Primary model name sent to Ollama. A value already set in the service environment overrides this default. |
 | `OLLAMA_MODEL_FALLBACK` | No | `glm-5.3-flash` | Tried once when the primary times out, returns an HTTP error, returns an empty reply, or includes a number that is not in the source. Set to empty to skip that retry. |
 | `SUMMARY_TIMEOUT` | No | `30` | Seconds to wait for each summary request before trying the fallback or sending the alert without a summary. |
+| `AI_WIRE_ENABLED` | No | off | `true`, `1`, `yes`, or `on` registers each successfully sent alert with AI Wire. Any other value, including unset, does nothing. |
+| `AI_WIRE_URL` | No | — | Registry origin. The bot POSTs to `{AI_WIRE_URL}/api/ingest/items`. |
+| `AI_WIRE_INGEST_TOKEN` | No | — | Bearer token for that endpoint. |
 
 The summary path is optional and fail-closed. The prompt asks for facts from the release notes only: versions and numbers copied verbatim, the source's verbs, no hype or opinion, and no speculation about impact. Sampling temperature is `0.2`. A reply that only fills reasoning fields counts as empty. If the summary contains a number or version that is not in the npm description or GitHub release notes, the fallback model is tried once; if that attempt also fails the check, the alert goes out without the model summary. If `OLLAMA_API_KEY` is missing, or both models fail, the alert still sends a few cleaned bullets from the release notes (Markdown removed, cut on a sentence or bullet) instead of a raw changelog. The npm package description is not repeated on every alert. The log line `Release summary answered by <model>` names which model produced the summary. Forwarded inbox events use this same summary and the same alert layout.
+
+AI Wire is also optional and fail-open. After Telegram accepts an alert from the poller or from `POST /v1/releases`, the bot can POST that same alert to `{AI_WIRE_URL}/api/ingest/items`. The push waits up to 5 seconds and tries once more. It does not run for a failed send, a duplicate inbox id, a GitHub tag that is the same release already announced from npm, or a `--test` preview. The chat is private, so the item has no `channel_post_url`. A registry failure is logged as `ai_wire push failed:` and the alert still counts as sent. Success is `ai_wire push ok n=` with the registry's upserted count.
 
 ## Deployment notes
 
@@ -106,6 +111,9 @@ python3 bot.py --test --package all
 python3 test_format.py    # Markdown conversion and the shared alert layout
 python3 test_watch.py     # version matching, GitHub tag prefixes, prerelease flags
 python3 test_summary.py   # summary fallback and invented-number guard
+python3 test_ai_wire.py   # AI Wire mapping, flag-off no-op, push never fails an alert
+python3 test_release_events.py
+python3 test_release_events_http.py
 ```
 
 Stdlib-only asserts, no test framework. `test_format.py` covers

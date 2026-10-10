@@ -16,7 +16,7 @@ fi
 
 # Create directory
 sudo mkdir -p "$BOT_DIR/data"
-sudo cp bot.py "$BOT_DIR/"
+sudo cp bot.py ai_wire.py "$BOT_DIR/"
 sudo chmod +x "$BOT_DIR/bot.py"
 sudo chown -R releasebot:releasebot "$BOT_DIR"
 

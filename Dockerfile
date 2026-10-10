@@ -4,7 +4,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # No third-party deps; bot.py uses only the standard library.
-COPY bot.py release_events.py runner.py ./
+COPY bot.py ai_wire.py release_events.py runner.py ./
 
 # Unbuffered stdout so Railway log streaming is live.
 ENV PYTHONUNBUFFERED=1
